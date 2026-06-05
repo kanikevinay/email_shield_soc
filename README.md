@@ -6,18 +6,17 @@ Email Shield is an automated heuristics engine for live phishing and threat anal
 ## Architecture & Project Structure
 ```text
 email_security_app/
+├── .env.template
+├── .gitignore
 ├── app/
 │   └── server.py
-├── config/
-│   ├── credentials.json
-│   └── token.json
 ├── core/
-│   └── scanner.py
-├── start_watch.py
-├── app_state.json
-├── scan_history.json
-├── .gitignore
-└── README.md
+│   ├── scanner.py
+│   └── supabase_store.py
+├── requirements.txt
+├── supabase_schema.sql
+├── README.md
+└── .gitignore
 ```
 
 ## Core Features
@@ -50,8 +49,9 @@ python -m uvicorn app.server:app --host 127.0.0.1 --port 8000
 ```
 
 ## Notes
-- `app_state.json` and `scan_history.json` are runtime artifacts and should not be committed.
-- Google token and credential files are intentionally excluded from version control.
+- Local runtime artifacts such as `app_state.json`, `scan_history.json`, and old single-user helper scripts have been removed from the production workspace.
+- `.env` is ignored by git so secrets stay local.
+- Google OAuth and Supabase credentials should be provided through environment variables on Render, not committed files.
 
 **Configuration (.env)**
 

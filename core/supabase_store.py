@@ -69,7 +69,7 @@ def _read_json_file(path: Path) -> Dict[str, Any]:
 
 
 def _app_secret(env_name: str, fallback: str) -> str:
-    value = os.getenv(env_name)
+    value = os.environ.get(env_name)
     if value:
         return value
     return fallback
@@ -172,10 +172,10 @@ def _credentials_config() -> Dict[str, Any]:
     installed_config = config.get('installed') if isinstance(config.get('installed'), dict) else {}
     merged = {**installed_config, **web_config}
     return {
-        'client_id': os.getenv('GOOGLE_CLIENT_ID') or merged.get('client_id', ''),
-        'client_secret': os.getenv('GOOGLE_CLIENT_SECRET') or merged.get('client_secret', ''),
+        'client_id': os.environ.get('GOOGLE_CLIENT_ID') or merged.get('client_id', ''),
+        'client_secret': os.environ.get('GOOGLE_CLIENT_SECRET') or merged.get('client_secret', ''),
         'auth_uri': merged.get('auth_uri', 'https://accounts.google.com/o/oauth2/v2/auth'),
-        'token_uri': os.getenv('GOOGLE_TOKEN_URI') or merged.get('token_uri', GOOGLE_TOKEN_URL),
+        'token_uri': os.environ.get('GOOGLE_TOKEN_URI') or merged.get('token_uri', GOOGLE_TOKEN_URL),
         'redirect_uris': merged.get('redirect_uris', []),
         'project_id': merged.get('project_id', ''),
     }
@@ -189,7 +189,7 @@ def get_google_client_config() -> Dict[str, Any]:
 
 
 def resolve_google_redirect_uri(request_base_url: Optional[str] = None) -> str:
-    configured = os.getenv('GOOGLE_OAUTH_REDIRECT_URI', '').strip()
+    configured = os.environ.get('GOOGLE_OAUTH_REDIRECT_URI', '').strip()
     if configured:
         return configured
     config = _credentials_config()
@@ -335,8 +335,8 @@ class SupabaseStore:
 
     @classmethod
     def from_env(cls) -> 'SupabaseStore':
-        base_url = os.getenv('SUPABASE_URL', '').strip()
-        service_role_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '').strip()
+        base_url = os.environ.get('SUPABASE_URL', '').strip()
+        service_role_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '').strip()
         if not base_url or not service_role_key:
             raise RuntimeError('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set')
         return cls(base_url, service_role_key)

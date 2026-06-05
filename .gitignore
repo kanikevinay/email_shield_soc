@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+.env
 config/token.json
 config/credentials.json
 app_state.json
