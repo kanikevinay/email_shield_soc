@@ -81,7 +81,7 @@ def _request_base_url(request: Request) -> str:
 
 
 def _cookie_secure(request: Request) -> bool:
-  env_flag = os.getenv('COOKIE_SECURE', '').strip().lower()
+  env_flag = os.environ.get('COOKIE_SECURE', '').strip().lower()
   if env_flag in {'1', 'true', 'yes', 'on'}:
     return True
   if env_flag in {'0', 'false', 'no', 'off'}:
@@ -209,7 +209,7 @@ def _scan_active_users_once() -> None:
       continue
 
     try:
-      refresh_token = decrypt_refresh_token(str(encrypted_refresh_token), secret=os.getenv('APP_TOKEN_ENCRYPTION_KEY'))
+      refresh_token = decrypt_refresh_token(str(encrypted_refresh_token), secret=os.environ.get('APP_TOKEN_ENCRYPTION_KEY'))
     except Exception as exc:
       logger.warning('Skipping user %s because refresh token decryption failed: %s', user_row.get('display_email'), exc)
       continue
@@ -265,8 +265,8 @@ def _background_poller_status() -> Dict[str, Any]:
   return {
     'running': bool(_poller_thread and _poller_thread.is_alive()),
     'interval_seconds': POLL_INTERVAL_SECONDS,
-    'supabase_configured': bool(os.getenv('SUPABASE_URL') and os.getenv('SUPABASE_SERVICE_ROLE_KEY')),
-    'google_oauth_configured': bool(os.getenv('GOOGLE_CLIENT_ID') or (CONFIG_DIR / 'credentials.json').exists()),
+    'supabase_configured': bool(os.environ.get('SUPABASE_URL') and os.environ.get('SUPABASE_SERVICE_ROLE_KEY')),
+    'google_oauth_configured': bool(os.environ.get('GOOGLE_CLIENT_ID') and os.environ.get('GOOGLE_CLIENT_SECRET')),
   }
 
 
@@ -390,7 +390,7 @@ def auth_callback(request: Request, code: Optional[str] = None, state: Optional[
     return JSONResponse({'status': 'error', 'message': 'Google user profile did not include an email address'}, status_code=400)
 
   user_uuid = google_user_uuid(google_subject, display_email)
-  encrypted_refresh_token = encrypt_refresh_token(refresh_token, secret=os.getenv('APP_TOKEN_ENCRYPTION_KEY'))
+  encrypted_refresh_token = encrypt_refresh_token(refresh_token, secret=os.environ.get('APP_TOKEN_ENCRYPTION_KEY'))
   store = _get_supabase_store()
   if not store:
     return JSONResponse({'status': 'error', 'message': 'Supabase is not configured'}, status_code=500)
@@ -485,7 +485,7 @@ async def scan_now(request: Request):
     return JSONResponse({'status': 'error', 'message': 'Backend configuration is incomplete'}, status_code=500)
 
   try:
-    refresh_token = decrypt_refresh_token(str(user_row.get('encrypted_refresh_token', '')), secret=os.getenv('APP_TOKEN_ENCRYPTION_KEY'))
+    refresh_token = decrypt_refresh_token(str(user_row.get('encrypted_refresh_token', '')), secret=os.environ.get('APP_TOKEN_ENCRYPTION_KEY'))
   except Exception as exc:
     return JSONResponse({'status': 'error', 'message': f'Unable to decrypt refresh token: {exc}'}, status_code=500)
 

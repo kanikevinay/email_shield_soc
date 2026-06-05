@@ -9,13 +9,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-CONFIG_DIR = ROOT_DIR / 'config'
-CREDENTIALS_FILE = CONFIG_DIR / 'credentials.json'
 GOOGLE_GMAIL_SCOPES = [
     'openid',
     'email',
@@ -55,19 +51,6 @@ create table if not exists public.scan_history (
 );
 ''',
 }
-
-
-def _read_json_file(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        with path.open('r', encoding='utf-8') as file_handle:
-            data = json.load(file_handle)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def _app_secret(env_name: str, fallback: str) -> str:
     value = os.environ.get(env_name)
     if value:
@@ -167,24 +150,20 @@ def generate_state_token() -> str:
 
 
 def _credentials_config() -> Dict[str, Any]:
-    config = _read_json_file(CREDENTIALS_FILE)
-    web_config = config.get('web') if isinstance(config.get('web'), dict) else {}
-    installed_config = config.get('installed') if isinstance(config.get('installed'), dict) else {}
-    merged = {**installed_config, **web_config}
     return {
-        'client_id': os.environ.get('GOOGLE_CLIENT_ID') or merged.get('client_id', ''),
-        'client_secret': os.environ.get('GOOGLE_CLIENT_SECRET') or merged.get('client_secret', ''),
-        'auth_uri': merged.get('auth_uri', 'https://accounts.google.com/o/oauth2/v2/auth'),
-        'token_uri': os.environ.get('GOOGLE_TOKEN_URI') or merged.get('token_uri', GOOGLE_TOKEN_URL),
-        'redirect_uris': merged.get('redirect_uris', []),
-        'project_id': merged.get('project_id', ''),
+        'client_id': os.environ.get('GOOGLE_CLIENT_ID', ''),
+        'client_secret': os.environ.get('GOOGLE_CLIENT_SECRET', ''),
+        'auth_uri': 'https://accounts.google.com/o/oauth2/v2/auth',
+        'token_uri': os.environ.get('GOOGLE_TOKEN_URI', GOOGLE_TOKEN_URL),
+        'redirect_uris': [],
+        'project_id': os.environ.get('GOOGLE_PROJECT_ID', ''),
     }
 
 
 def get_google_client_config() -> Dict[str, Any]:
     config = _credentials_config()
     if not config['client_id'] or not config['client_secret']:
-        raise RuntimeError('Google OAuth client configuration is missing in config/credentials.json or environment variables.')
+        raise RuntimeError('Google OAuth client configuration is missing required environment variables.')
     return config
 
 
@@ -192,12 +171,6 @@ def resolve_google_redirect_uri(request_base_url: Optional[str] = None) -> str:
     configured = os.environ.get('GOOGLE_OAUTH_REDIRECT_URI', '').strip()
     if configured:
         return configured
-    config = _credentials_config()
-    redirect_uris = config.get('redirect_uris') or []
-    if isinstance(redirect_uris, list) and redirect_uris:
-        first_uri = redirect_uris[0]
-        if isinstance(first_uri, str) and first_uri.strip():
-            return first_uri.strip()
     if request_base_url:
         return request_base_url.rstrip('/') + '/auth/callback'
     return 'http://127.0.0.1:8000/auth/callback'

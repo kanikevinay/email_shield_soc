@@ -30,9 +30,7 @@ email_security_app/
 1. Clone the repository.
 2. Create and activate the virtual environment from the project root.
 3. Install the required Python dependencies.
-4. Place Google Cloud authentication files in `config/` safely:
-   - `config/credentials.json`
-   - `config/token.json`
+4. Copy `.env.template` to `.env` and fill in the deployment variables for Supabase and Google OAuth.
 
 Example setup commands:
 ```powershell
@@ -51,7 +49,7 @@ python -m uvicorn app.server:app --host 127.0.0.1 --port 8000
 ## Notes
 - Local runtime artifacts such as `app_state.json`, `scan_history.json`, and old single-user helper scripts have been removed from the production workspace.
 - `.env` is ignored by git so secrets stay local.
-- Google OAuth and Supabase credentials should be provided through environment variables on Render, not committed files.
+- Google OAuth and Supabase credentials are expected through environment variables on Render, not committed files.
 
 **Configuration (.env)**
 
