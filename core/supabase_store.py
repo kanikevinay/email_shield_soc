@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import secrets
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -128,6 +129,18 @@ def sign_payload(payload: Dict[str, Any], secret: Optional[str] = None) -> str:
     encoded_payload = base64.urlsafe_b64encode(payload_json).decode('ascii').rstrip('=')
     encoded_signature = base64.urlsafe_b64encode(signature).decode('ascii').rstrip('=')
     return f'{encoded_payload}.{encoded_signature}'
+
+
+def create_csrf_state() -> str:
+    return sign_payload({'nonce': secrets.token_urlsafe(24), 'issued_at': int(time.time())}, secret='oauth-state')
+
+
+def validate_csrf_state(token: str, max_age_seconds: int = 600) -> Dict[str, Any]:
+    payload = verify_signed_payload(token, secret='oauth-state')
+    issued_at = int(payload.get('issued_at', 0) or 0)
+    if max_age_seconds and int(time.time()) - issued_at > max_age_seconds:
+        raise ValueError('OAuth state has expired')
+    return payload
 
 
 def verify_signed_payload(token: str, secret: Optional[str] = None) -> Dict[str, Any]:
@@ -261,6 +274,28 @@ def fetch_google_userinfo(access_token: str) -> Dict[str, Any]:
 def google_user_uuid(google_subject: str, display_email: str) -> str:
     seed = google_subject or display_email.lower().strip()
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f'google:{seed}'))
+
+
+def build_scan_history_record(
+    user_uuid: str,
+    scan_result: Dict[str, Any],
+    source: str = 'gmail',
+    timestamp: Optional[str] = None,
+) -> Dict[str, Any]:
+    result = scan_result if isinstance(scan_result, dict) else {}
+    flags = result.get('flags', []) if isinstance(result.get('flags', []), list) else []
+    return {
+        'user_uuid': user_uuid,
+        'source': source,
+        'sender': result.get('sender') or 'Unknown Sender',
+        'subject': result.get('subject') or 'No Subject',
+        'risk_score': int(result.get('risk_score') or 0),
+        'timestamp': timestamp or result.get('received_at') or time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'triggered_flags': flags,
+        'message_id': result.get('message_id') or '',
+        'thread_id': result.get('thread_id'),
+        'status': result.get('status', 'clean'),
+    }
 
 
 def _request_json(base_url: str, service_role_key: str, method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Any] = None) -> Any:
