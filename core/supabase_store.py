@@ -58,6 +58,22 @@ def _app_secret(env_name: str, fallback: str) -> str:
     return fallback
 
 
+def _validate_supabase_url(base_url: str) -> str:
+    candidate = (base_url or '').strip()
+    if not candidate:
+        raise RuntimeError('SUPABASE_URL must be set to a valid https URL')
+
+    lowered = candidate.lower()
+    if 'your copied supabase project url' in lowered or 'your-project.supabase.co' in lowered or 'placeholder' in lowered:
+        raise RuntimeError('SUPABASE_URL contains a placeholder value; set the real Supabase project URL')
+
+    parsed = urllib.parse.urlparse(candidate)
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+        raise RuntimeError('SUPABASE_URL must be a valid absolute http(s) URL')
+
+    return candidate.rstrip('/')
+
+
 def _derive_key(secret: str) -> bytes:
     return hashlib.sha256(secret.encode('utf-8')).digest()
 
@@ -303,7 +319,7 @@ def _request_json(base_url: str, service_role_key: str, method: str, path: str, 
 
 class SupabaseStore:
     def __init__(self, base_url: str, service_role_key: str) -> None:
-        self.base_url = base_url.rstrip('/')
+        self.base_url = _validate_supabase_url(base_url)
         self.service_role_key = service_role_key
 
     @classmethod
