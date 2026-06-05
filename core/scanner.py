@@ -225,9 +225,12 @@ def _analyze_email_message(message: Dict[str, Any]) -> Dict[str, Any]:
 
     subject = _header_value(headers, 'subject', 'No Subject')
     sender = _header_value(headers, 'from', 'Unknown Sender')
+    snippet = message.get('snippet', '')
     email_body = extract_email_body(payload)
     subject_lower = subject.lower()
+    snippet_lower = snippet.lower()
     email_body_lower = email_body.lower()
+    combined_text = ' '.join(part for part in [subject, sender, snippet, email_body] if part).lower()
 
     print("\n" + "=" * 50)
     print("📥 LIVE EMAIL INTERCEPTED")
@@ -243,18 +246,18 @@ def _analyze_email_message(message: Dict[str, Any]) -> Dict[str, Any]:
         r"bank account", r"crypto", r"login to your", r"urgent windows",
     ]
     for pattern in danger_keywords:
-        if re.search(pattern, subject_lower) or re.search(pattern, email_body_lower):
+        if re.search(pattern, combined_text):
             risk_score += 35
             flags_triggered.append(f"Suspicious terminology pattern matched: '{pattern}'")
 
     urgency_keywords = [r"immediately", r"within 24 hours", r"final warning", r"locked out"]
     for pattern in urgency_keywords:
-        if re.search(pattern, subject_lower) or re.search(pattern, email_body_lower):
+        if re.search(pattern, combined_text):
             risk_score += 20
             flags_triggered.append('High urgency tone detected (coercion tactic).')
             break
 
-    urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', email_body)
+    urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', ' '.join(part for part in [snippet, email_body] if part))
     if urls:
         risk_score += 10
         for url in urls:
@@ -292,6 +295,138 @@ def _analyze_email_message(message: Dict[str, Any]) -> Dict[str, Any]:
         'thread_id': message.get('threadId'),
         'received_at': _extract_message_timestamp(message),
         'snippet': message.get('snippet', ''),
+    }
+
+
+def build_gmail_service_from_refresh_token(
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+    token_uri: str = 'https://oauth2.googleapis.com/token',
+):
+    if not refresh_token or not client_id or not client_secret:
+        return None
+
+    try:
+        creds = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri=token_uri,
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=SCOPES,
+        )
+        creds.refresh(Request())
+    except Exception as exc:
+        print(f"[❌] Failed to refresh dynamic Gmail credentials: {exc}")
+        return None
+
+    try:
+        return build('gmail', 'v1', credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        print(f"[❌] Failed to build dynamic Gmail service client: {exc}")
+        return None
+
+
+def scan_message_by_id_with_service(service, message_id: str):
+    if not service:
+        return {'status': 'error', 'message': 'Gmail service unavailable'}
+
+    if not message_id:
+        return {'status': 'error', 'message': 'Missing Gmail message id'}
+
+    try:
+        message = service.users().messages().get(
+            userId='me',
+            id=message_id,
+            format='metadata',
+            metadataHeaders=['From', 'Subject'],
+        ).execute()
+    except HttpError as exc:
+        error_message = f'Gmail API request failed while fetching message {message_id}: {exc}'
+        print(f"[❌] {error_message}")
+        return {'status': 'error', 'message': error_message}
+    except Exception as exc:
+        error_message = f'Unexpected error while fetching message {message_id}: {exc}'
+        print(f"[❌] {error_message}")
+        return {'status': 'error', 'message': error_message}
+
+    return _analyze_email_message(message)
+
+
+def scan_recent_unread_messages_for_user(
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+    token_uri: str = 'https://oauth2.googleapis.com/token',
+    max_results: int = 5,
+) -> Dict[str, Any]:
+    service = build_gmail_service_from_refresh_token(refresh_token, client_id, client_secret, token_uri=token_uri)
+    if not service:
+        return {'status': 'error', 'message': 'Gmail service unavailable', 'scans': [], 'processed_message_ids': []}
+
+    try:
+        results = service.users().messages().list(
+            userId='me',
+            maxResults=max_results,
+            q='is:unread in:inbox',
+        ).execute()
+    except HttpError as exc:
+        message = f'Gmail API request failed while listing unread messages: {exc}'
+        print(f"[❌] {message}")
+        return {'status': 'error', 'message': message, 'scans': [], 'processed_message_ids': []}
+    except Exception as exc:
+        message = f'Unexpected error while listing unread messages: {exc}'
+        print(f"[❌] {message}")
+        return {'status': 'error', 'message': message, 'scans': [], 'processed_message_ids': []}
+
+    messages = results.get('messages', []) if isinstance(results, dict) else []
+    if not messages:
+        return {
+            'status': 'no_unread_messages',
+            'message': 'No unread inbox messages found',
+            'scans': [],
+            'processed_message_ids': [],
+        }
+
+    scans: List[Dict[str, Any]] = []
+    processed_message_ids: List[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        message_id = message.get('id')
+        if not message_id:
+            continue
+        processed_message_ids.append(message_id)
+        scans.append(scan_message_by_id_with_service(service, message_id))
+
+    critical_count = sum(1 for item in scans if item.get('status') == 'critical')
+    warning_count = sum(1 for item in scans if item.get('status') == 'warning')
+    clean_count = sum(1 for item in scans if item.get('status') == 'clean')
+    error_count = sum(1 for item in scans if item.get('status') == 'error')
+    max_risk_score = max((int(item.get('risk_score', 0)) for item in scans if isinstance(item.get('risk_score'), int)), default=0)
+
+    if critical_count:
+        overall_status = 'critical'
+    elif warning_count:
+        overall_status = 'warning'
+    elif clean_count:
+        overall_status = 'clean'
+    elif error_count:
+        overall_status = 'error'
+    else:
+        overall_status = 'no_changes'
+
+    return {
+        'status': overall_status,
+        'risk_score': max_risk_score,
+        'scan_count': len(scans),
+        'critical_count': critical_count,
+        'warning_count': warning_count,
+        'clean_count': clean_count,
+        'error_count': error_count,
+        'scans': scans,
+        'processed_message_ids': processed_message_ids,
     }
 
 

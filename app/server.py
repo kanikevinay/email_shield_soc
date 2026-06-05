@@ -5,33 +5,41 @@ import logging
 import socket
 import threading
 import sys
+import os
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 CONFIG_DIR = ROOT_DIR / 'config'
-TOKEN_FILE = CONFIG_DIR / 'token.json'
-CREDENTIALS_FILE = CONFIG_DIR / 'credentials.json'
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
+from core.supabase_store import (
+  SupabaseStore,
+  build_google_authorization_url,
+  build_scan_history_record,
+  create_csrf_state,
+  decrypt_refresh_token,
+  encrypt_refresh_token,
+  exchange_google_authorization_code,
+  fetch_google_userinfo,
+  get_google_client_config,
+  resolve_google_redirect_uri,
+  sign_payload,
+  validate_csrf_state,
+  verify_signed_payload,
+)
 from core.scanner import (
-    get_recent_scans,
-    get_latest_successful_scan,
-    is_newer_history_id,
-    get_current_history_id,
-    load_runtime_state,
-    record_scan_result,
-    scan_latest_email,
-    scan_messages_since_history_id,
-    update_runtime_state,
+  scan_recent_unread_messages_for_user,
 )
 
 
@@ -39,24 +47,217 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL_SECONDS = 10
 _poll_stop_event = threading.Event()
 _poller_thread: Optional[threading.Thread] = None
+_supabase_store: Optional[SupabaseStore] = None
+
+
+def _get_supabase_store() -> Optional[SupabaseStore]:
+  global _supabase_store
+  if _supabase_store is not None:
+    return _supabase_store
+  try:
+    _supabase_store = SupabaseStore.from_env()
+  except Exception as exc:
+    logger.error('Supabase store is unavailable: %s', exc)
+    return None
+  return _supabase_store
+
+
+def _get_google_oauth_config(request_base_url: Optional[str] = None) -> Optional[Any]:
+  try:
+    config = get_google_client_config()
+    config['redirect_uri'] = resolve_google_redirect_uri(request_base_url)
+    return SimpleNamespace(**config)
+  except Exception as exc:
+    logger.error('Google OAuth configuration is unavailable: %s', exc)
+    return None
+
+
+def _request_base_url(request: Request) -> str:
+  forwarded_proto = request.headers.get('x-forwarded-proto')
+  forwarded_host = request.headers.get('x-forwarded-host')
+  scheme = forwarded_proto or request.url.scheme or 'http'
+  host = forwarded_host or request.headers.get('host') or request.url.netloc
+  return f'{scheme}://{host}'
+
+
+def _cookie_secure(request: Request) -> bool:
+  env_flag = os.getenv('COOKIE_SECURE', '').strip().lower()
+  if env_flag in {'1', 'true', 'yes', 'on'}:
+    return True
+  if env_flag in {'0', 'false', 'no', 'off'}:
+    return False
+  return request.url.scheme == 'https' or request.headers.get('x-forwarded-proto', '').lower() == 'https'
+
+
+def _set_session_cookie(response: RedirectResponse, session_payload: Dict[str, Any], request: Request) -> None:
+  response.set_cookie(
+    key='email_shield_session',
+    value=sign_payload(session_payload, purpose='session'),
+    httponly=True,
+    secure=_cookie_secure(request),
+    samesite='lax',
+    max_age=60 * 60 * 24 * 7,
+    path='/',
+  )
+
+
+def _get_session_payload(request: Request) -> Optional[Dict[str, Any]]:
+  token = request.cookies.get('email_shield_session')
+  if not token:
+    return None
+  try:
+    payload = verify_signed_payload(token, purpose='session')
+  except Exception:
+    return None
+
+  issued_at = int(payload.get('issued_at', 0) or 0)
+  if issued_at and (datetime.now(timezone.utc).timestamp() - issued_at) > 60 * 60 * 24 * 7:
+    return None
+  return payload
+
+
+def _user_from_request(request: Request) -> Optional[Dict[str, Any]]:
+  session_payload = _get_session_payload(request)
+  if not session_payload:
+    return None
+  user_uuid = session_payload.get('user_uuid')
+  if not user_uuid:
+    return None
+  store = _get_supabase_store()
+  if not store:
+    return None
+  user_row = store.get_user(str(user_uuid))
+  if not isinstance(user_row, dict):
+    return None
+  return user_row
+
+
+def _scan_row_to_entry(scan_row: Dict[str, Any]) -> Dict[str, Any]:
+  if not isinstance(scan_row, dict):
+    return {}
+  result = {
+    'status': scan_row.get('status', 'clean'),
+    'risk_score': int(scan_row.get('risk_score') or 0),
+    'flags': scan_row.get('triggered_flags', []) if isinstance(scan_row.get('triggered_flags', []), list) else [],
+    'sender': scan_row.get('sender', 'Unknown Sender') or 'Unknown Sender',
+    'subject': scan_row.get('subject', 'No Subject') or 'No Subject',
+    'message_id': scan_row.get('message_id'),
+    'thread_id': scan_row.get('thread_id'),
+    'received_at': scan_row.get('timestamp'),
+    'snippet': scan_row.get('snippet', ''),
+  }
+  return {
+    'timestamp': scan_row.get('timestamp'),
+    'source': scan_row.get('source', 'gmail'),
+    'result': result,
+  }
+
+
+def _serialize_scan_rows(scan_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+  return [_scan_row_to_entry(row) for row in scan_rows if isinstance(row, dict)]
+
+
+def _scan_result_to_history_rows(user_uuid: str, scan_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+  rows: List[Dict[str, Any]] = []
+  if not isinstance(scan_result, dict):
+    return rows
+  scans = scan_result.get('scans', []) if isinstance(scan_result.get('scans', []), list) else []
+  for child_scan in scans:
+    if isinstance(child_scan, dict):
+      rows.append(build_scan_history_record(user_uuid, child_scan, source='poller'))
+  return rows
+
+
+def _ingest_scan_result(store: SupabaseStore, user_row: Dict[str, Any], scan_result: Dict[str, Any], source: str) -> List[Dict[str, Any]]:
+  inserted_rows: List[Dict[str, Any]] = []
+  user_uuid = str(user_row.get('user_uuid', ''))
+  if not user_uuid:
+    return inserted_rows
+
+  scans = scan_result.get('scans', []) if isinstance(scan_result.get('scans', []), list) else []
+  for child_scan in scans:
+    if not isinstance(child_scan, dict):
+      continue
+    record = build_scan_history_record(user_uuid, child_scan, source=source)
+    inserted_rows.append(store.insert_scan_history(record))
+  return inserted_rows
+
+
+def _scan_active_users_once() -> None:
+  store = _get_supabase_store()
+  if not store:
+    return
+
+  try:
+    active_users = store.list_active_users()
+  except Exception as exc:
+    logger.exception('Failed to load active users: %s', exc)
+    return
+
+  if not active_users:
+    return
+
+  oauth_config = _get_google_oauth_config()
+  if not oauth_config:
+    return
+
+  for user_row in active_users:
+    if not isinstance(user_row, dict):
+      continue
+    encrypted_refresh_token = user_row.get('encrypted_refresh_token', '')
+    if not encrypted_refresh_token:
+      continue
+
+    try:
+      refresh_token = decrypt_refresh_token(str(encrypted_refresh_token), secret=os.getenv('APP_TOKEN_ENCRYPTION_KEY'))
+    except Exception as exc:
+      logger.warning('Skipping user %s because refresh token decryption failed: %s', user_row.get('display_email'), exc)
+      continue
+
+    try:
+      scan_result = scan_recent_unread_messages_for_user(
+        refresh_token=refresh_token,
+        client_id=oauth_config.client_id,
+        client_secret=oauth_config.client_secret,
+        token_uri=oauth_config.token_uri,
+      )
+    except Exception as exc:
+      logger.exception('User scan failed for %s: %s', user_row.get('display_email'), exc)
+      continue
+
+    try:
+      _ingest_scan_result(store, user_row, scan_result, source='poller')
+    except Exception as exc:
+      logger.exception('Failed to persist scan history for %s: %s', user_row.get('display_email'), exc)
+
+
+def _current_user_scans(request: Request, limit: int = 25) -> List[Dict[str, Any]]:
+  user_row = _user_from_request(request)
+  if not user_row:
+    return []
+  store = _get_supabase_store()
+  if not store:
+    return []
+  try:
+    scan_rows = store.list_user_scans(str(user_row['user_uuid']), limit=limit)
+  except Exception as exc:
+    logger.exception('Failed to load scans for %s: %s', user_row.get('display_email'), exc)
+    return []
+  return _serialize_scan_rows(scan_rows)
 
 
 def _background_poller_files_ready() -> bool:
-  if not TOKEN_FILE.exists():
-    logger.error(
-      'Background Gmail poller cannot start until this file exists: %s',
-      TOKEN_FILE,
-    )
+  store = _get_supabase_store()
+  if not store:
+    logger.error('Background Gmail poller cannot start until Supabase is configured.')
     return False
 
-  if not CREDENTIALS_FILE.exists():
-    logger.warning('config/credentials.json is missing; Gmail watch setup will not be available.')
+  oauth_config = _get_google_oauth_config()
+  if not oauth_config:
+    logger.error('Background Gmail poller cannot start until Google OAuth is configured.')
+    return False
 
-  logger.info(
-    'Background Gmail poller config ready: token=%s credentials=%s',
-    TOKEN_FILE,
-    CREDENTIALS_FILE,
-  )
+  logger.info('Background Gmail poller config ready for multi-user monitoring.')
   return True
 
 
@@ -64,8 +265,8 @@ def _background_poller_status() -> Dict[str, Any]:
   return {
     'running': bool(_poller_thread and _poller_thread.is_alive()),
     'interval_seconds': POLL_INTERVAL_SECONDS,
-    'token_file_exists': TOKEN_FILE.exists(),
-    'credentials_file_exists': CREDENTIALS_FILE.exists(),
+    'supabase_configured': bool(os.getenv('SUPABASE_URL') and os.getenv('SUPABASE_SERVICE_ROLE_KEY')),
+    'google_oauth_configured': bool(os.getenv('GOOGLE_CLIENT_ID') or (CONFIG_DIR / 'credentials.json').exists()),
   }
 
 
@@ -99,18 +300,22 @@ def _is_port_available(host: str, port: int) -> bool:
     return probe_socket.connect_ex((host, port)) != 0
 
 
+@app.get('/ping')
+def ping():
+  return {'status': 'awake'}
+
+
 @app.get("/health")
-def health():
-  state = load_runtime_state()
-  recent_scans = get_recent_scans(limit=12)
-  latest_entry = get_latest_successful_scan(limit=12) or {}
+def health(request: Request):
+  user_row = _user_from_request(request)
+  recent_scans = _current_user_scans(request, limit=12) if user_row else []
+  latest_entry = recent_scans[0] if recent_scans else {}
   latest_result = latest_entry.get('result', {}) if isinstance(latest_entry, dict) else {}
   return {
     'status': 'online',
-    'watch': {
-      'last_history_id': state.get('last_history_id'),
-      'last_watch_expiration': state.get('last_watch_expiration'),
-      'watch_topic': state.get('watch_topic'),
+    'user': {
+      'authenticated': bool(user_row),
+      'display_email': user_row.get('display_email') if isinstance(user_row, dict) else None,
     },
     'latest_scan': latest_result,
     'recent_scan_count': len(recent_scans),
@@ -119,25 +324,108 @@ def health():
 
 
 @app.get("/")
-def home():
-  state = load_runtime_state()
-  recent_scans = get_recent_scans(limit=12)
-  latest_successful_entry = get_latest_successful_scan(limit=12)
-  return HTMLResponse(_render_dashboard(state, recent_scans, latest_successful_entry))
+def home(request: Request):
+  user_row = _user_from_request(request)
+  recent_scans = _current_user_scans(request, limit=12) if user_row else []
+  latest_successful_entry = recent_scans[0] if recent_scans else None
+  return HTMLResponse(_render_dashboard({}, recent_scans, latest_successful_entry, user_row))
+
+
+@app.get('/auth/login')
+def auth_login(request: Request):
+  oauth_config = _get_google_oauth_config(_request_base_url(request))
+  if not oauth_config:
+    return JSONResponse({'status': 'error', 'message': 'Google OAuth is not configured'}, status_code=500)
+
+  state_token = create_csrf_state()
+  authorization_url = build_google_authorization_url(oauth_config.redirect_uri, state_token)
+  response = RedirectResponse(authorization_url, status_code=302)
+  response.set_cookie(
+    key='email_shield_oauth_state',
+    value=state_token,
+    httponly=True,
+    secure=_cookie_secure(request),
+    samesite='lax',
+    max_age=600,
+    path='/',
+  )
+  return response
+
+
+@app.get('/auth/callback')
+def auth_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+  if error:
+    return JSONResponse({'status': 'error', 'message': error}, status_code=400)
+
+  if not code or not state:
+    return JSONResponse({'status': 'error', 'message': 'Missing OAuth code or state'}, status_code=400)
+
+  cookie_state = request.cookies.get('email_shield_oauth_state')
+  if not cookie_state or cookie_state != state:
+    return JSONResponse({'status': 'error', 'message': 'OAuth state validation failed'}, status_code=400)
+
+  try:
+    validate_csrf_state(state)
+  except Exception as exc:
+    return JSONResponse({'status': 'error', 'message': str(exc)}, status_code=400)
+
+  oauth_config = _get_google_oauth_config(_request_base_url(request))
+  if not oauth_config:
+    return JSONResponse({'status': 'error', 'message': 'Google OAuth is not configured'}, status_code=500)
+
+  try:
+    token_payload = exchange_google_authorization_code(code, oauth_config)
+    access_token = str(token_payload.get('access_token', ''))
+    refresh_token = str(token_payload.get('refresh_token', ''))
+    if not refresh_token:
+      return JSONResponse({'status': 'error', 'message': 'Google did not return a refresh token'}, status_code=400)
+    userinfo = fetch_google_userinfo(access_token)
+  except Exception as exc:
+    logger.exception('OAuth callback failed: %s', exc)
+    return JSONResponse({'status': 'error', 'message': str(exc)}, status_code=400)
+
+  display_email = str(userinfo.get('email') or '').strip().lower()
+  google_subject = str(userinfo.get('id') or userinfo.get('sub') or display_email)
+  if not display_email:
+    return JSONResponse({'status': 'error', 'message': 'Google user profile did not include an email address'}, status_code=400)
+
+  user_uuid = google_user_uuid(google_subject, display_email)
+  encrypted_refresh_token = encrypt_refresh_token(refresh_token, secret=os.getenv('APP_TOKEN_ENCRYPTION_KEY'))
+  store = _get_supabase_store()
+  if not store:
+    return JSONResponse({'status': 'error', 'message': 'Supabase is not configured'}, status_code=500)
+
+  store.upsert_user(user_uuid, display_email, encrypted_refresh_token, active_monitoring=True)
+  session_payload = {
+    'session_id': str(uuid.uuid4()),
+    'user_uuid': user_uuid,
+    'email': display_email,
+    'issued_at': int(datetime.now(timezone.utc).timestamp()),
+  }
+  response = RedirectResponse(url='/', status_code=302)
+  _set_session_cookie(response, session_payload, request)
+  response.delete_cookie('email_shield_oauth_state', path='/')
+  return response
+
+
+@app.get('/api/scans')
+def api_scans(request: Request):
+  user_row = _user_from_request(request)
+  if not user_row:
+    return JSONResponse({'items': [], 'status': 'unauthorized'}, status_code=401)
+  return JSONResponse({'items': _current_user_scans(request, limit=25), 'status': 'success'})
 
 
 @app.get("/api/status")
-def api_status():
-  state = load_runtime_state()
-  recent_scans = get_recent_scans(limit=12)
-  latest_successful_entry = get_latest_successful_scan(limit=12)
+def api_status(request: Request):
+  user_row = _user_from_request(request)
+  recent_scans = _current_user_scans(request, limit=12) if user_row else []
+  latest_successful_entry = recent_scans[0] if recent_scans else None
   return JSONResponse({
     'status': 'online',
-    'watch': {
-      'last_history_id': state.get('last_history_id'),
-      'last_watch_expiration': state.get('last_watch_expiration'),
-      'watch_topic': state.get('watch_topic'),
-      'last_webhook_at': state.get('last_webhook_at'),
+    'user': {
+      'authenticated': bool(user_row),
+      'display_email': user_row.get('display_email') if isinstance(user_row, dict) else None,
     },
     'latest_scan': latest_successful_entry,
     'recent_scans': recent_scans,
@@ -146,45 +434,23 @@ def api_status():
 
 
 @app.get("/api/recent-scans")
-def api_recent_scans():
-    return JSONResponse({'items': get_recent_scans(limit=25)})
+def api_recent_scans(request: Request):
+    return api_scans(request)
 
 
 def _poll_mailbox_once() -> None:
-  state = load_runtime_state()
-  current_history_id = get_current_history_id()
-
-  if not current_history_id:
-    return
-
-  previous_history_id = state.get('last_history_id')
-  if not previous_history_id:
-    update_runtime_state({'last_history_id': current_history_id})
-    return
-
-  if not is_newer_history_id(current_history_id, previous_history_id):
-    return
-
-  scan_result = scan_messages_since_history_id(previous_history_id)
-  if isinstance(scan_result, dict) and isinstance(scan_result.get('scans'), list) and scan_result.get('scans'):
-    for child_scan in scan_result['scans']:
-      if isinstance(child_scan, dict):
-        child_status = child_scan.get('status')
-        if child_status in {'critical', 'warning', 'clean', 'no_changes', 'no_history', 'no_unread_messages'}:
-          record_scan_result(child_scan, source='poller')
-
-  update_runtime_state({'last_history_id': current_history_id})
+  _scan_active_users_once()
 
 
 def _poll_mailbox_forever() -> None:
-    while not _poll_stop_event.is_set():
-        try:
-            _poll_mailbox_once()
-        except Exception as exc:
-            logger.exception('Background Gmail poller failed: %s', exc)
+  while not _poll_stop_event.is_set():
+    try:
+      _poll_mailbox_once()
+    except Exception as exc:
+      logger.exception('Background Gmail poller failed: %s', exc)
 
-        if _poll_stop_event.wait(POLL_INTERVAL_SECONDS):
-            break
+    if _poll_stop_event.wait(POLL_INTERVAL_SECONDS):
+      break
 
 
 def _start_background_poller() -> None:
@@ -197,6 +463,8 @@ def _start_background_poller() -> None:
     _poller_thread = threading.Thread(target=_poll_mailbox_forever, name='gmail-poller', daemon=True)
     _poller_thread.start()
     logger.info('Started background Gmail poller thread with %s second interval.', POLL_INTERVAL_SECONDS)
+
+
 def _stop_background_poller() -> None:
     global _poller_thread
     _poll_stop_event.set()
@@ -206,25 +474,42 @@ def _stop_background_poller() -> None:
 
 
 @app.post("/scan-now")
-async def scan_now():
-    scan_result = await run_in_threadpool(scan_latest_email)
-    record_scan_result(scan_result, source='manual')
-    status_code = 500 if scan_result.get('status') == 'error' else 200
-    return JSONResponse(
-        {
-            'status': 'success' if status_code == 200 else 'error',
-            'scan': scan_result,
-        },
-        status_code=status_code,
-    )
+async def scan_now(request: Request):
+  user_row = _user_from_request(request)
+  if not user_row:
+    return JSONResponse({'status': 'error', 'message': 'Authentication required'}, status_code=401)
+
+  store = _get_supabase_store()
+  oauth_config = _get_google_oauth_config(_request_base_url(request))
+  if not store or not oauth_config:
+    return JSONResponse({'status': 'error', 'message': 'Backend configuration is incomplete'}, status_code=500)
+
+  try:
+    refresh_token = decrypt_refresh_token(str(user_row.get('encrypted_refresh_token', '')), secret=os.getenv('APP_TOKEN_ENCRYPTION_KEY'))
+  except Exception as exc:
+    return JSONResponse({'status': 'error', 'message': f'Unable to decrypt refresh token: {exc}'}, status_code=500)
+
+  scan_result = await run_in_threadpool(
+    scan_recent_unread_messages_for_user,
+    refresh_token,
+    oauth_config.client_id,
+    oauth_config.client_secret,
+    oauth_config.token_uri,
+  )
+  await run_in_threadpool(_ingest_scan_result, store, user_row, scan_result, 'manual')
+  status_code = 500 if scan_result.get('status') == 'error' else 200
+  return JSONResponse(
+    {
+      'status': 'success' if status_code == 200 else 'error',
+      'scan': _scan_result_to_history_rows(str(user_row.get('user_uuid', '')), scan_result),
+    },
+    status_code=status_code,
+  )
 
 
 @app.get("/test-scan")
-async def test_scan():
-    scan_result = await run_in_threadpool(scan_latest_email)
-    record_scan_result(scan_result, source='manual')
-    status_code = 500 if scan_result.get('status') == 'error' else 200
-    return JSONResponse(scan_result, status_code=status_code)
+async def test_scan(request: Request):
+  return await scan_now(request)
 
 
 def _decode_pubsub_message_data(encoded_data: Any) -> Dict[str, Any]:
@@ -327,7 +612,7 @@ async def receive_gmail_notification(request: Request):
     )
 
 
-def _render_dashboard(state: Dict[str, Any], recent_scans: List[Dict[str, Any]], latest_entry: Optional[Dict[str, Any]] = None) -> str:
+def _render_dashboard(state: Dict[str, Any], recent_scans: List[Dict[str, Any]], latest_entry: Optional[Dict[str, Any]] = None, current_user: Optional[Dict[str, Any]] = None) -> str:
     display_scans = _get_displayable_scans(recent_scans)
     latest_entry = latest_entry or (display_scans[0] if display_scans else None)
     latest_result = latest_entry.get('result', {}) if isinstance(latest_entry, dict) else {}
@@ -346,6 +631,8 @@ def _render_dashboard(state: Dict[str, Any], recent_scans: List[Dict[str, Any]],
     headline_status = _headline_status_text(state, latest_entry)
     headline_state_class = _headline_state_class(state, latest_entry)
     pipeline_copy = _pipeline_copy(state, latest_entry)
+    auth_button_html = '<a class="button" href="/auth/login">Sign in with Google</a>' if not current_user else '<span class="status-chip live">Signed in as ' + escape(str(current_user.get('display_email', 'unknown'))) + '</span>'
+    session_copy = 'Sign in with Google to unlock your personal scan stream.' if not current_user else 'Monitoring ' + escape(str(current_user.get('display_email', 'unknown'))) + ' in real time.'
     display_scans = _dedupe_display_scans(display_scans)
     stream_rows = '\n'.join(_render_stream_row(entry, index, index == 0) for index, entry in enumerate(display_scans))
     if not stream_rows:
@@ -490,10 +777,11 @@ def _render_dashboard(state: Dict[str, Any], recent_scans: List[Dict[str, Any]],
       <div class="brand">
         <div class="kicker">Security Operations Center</div>
         <h1>Email Shield</h1>
-        <p class="sub">Focused live threat stream with selected message analysis.</p>
+        <p class="sub">{session_copy}</p>
       </div>
       <div class="actions">
         <div class="status-chip {headline_state_class}" id="pipeline-status">{escape(headline_status)}</div>
+        {auth_button_html}
         <button class="button" type="button" onclick="runScanNow(this)">⚡ Trigger Manual Scan</button>
         <a class="button secondary" href="/api/status" target="_blank" rel="noreferrer">API Status</a>
       </div>
@@ -766,13 +1054,13 @@ def _render_dashboard(state: Dict[str, Any], recent_scans: List[Dict[str, Any]],
 
     async function syncLiveStream(forceRender) {{
       try {{
-        const response = await fetch('/api/status', {{ cache: 'no-store' }});
+        const response = await fetch('/api/scans', {{ cache: 'no-store' }});
         if (!response.ok) {{
-          throw new Error('Status endpoint returned ' + response.status);
+          throw new Error('Scan endpoint returned ' + response.status);
         }}
 
         const payload = await response.json();
-        const nextScans = Array.isArray(payload.recent_scans) ? payload.recent_scans : [];
+        const nextScans = Array.isArray(payload.items) ? payload.items : [];
         const nextSnapshot = nextScans.map((entry) => scanSignature(entry)).join('||');
 
         if (forceRender || nextSnapshot !== lastSnapshot) {{

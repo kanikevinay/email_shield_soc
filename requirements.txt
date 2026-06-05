@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+starlette
+google-auth
+google-api-python-client
+supabase
+cryptography
